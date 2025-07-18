@@ -1,91 +1,131 @@
-
 import requests
 import time
-import math
-from telegram import Bot
-from flask import Flask
 import threading
+from flask import Flask
+from telegram import Bot
+import numpy as np
 
+# === TELEGRAM ===
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
 bot = Bot(token=TOKEN)
 
-# ✅ Тестовое сообщение — УДАЛИ после проверки
-bot.send_message(chat_id=CHAT_ID, text="✅ Тестовое сообщение: бот работает!")
-
+# === FLASK SERVER (Render) ===
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
     return "I'm alive!"
 
-def get_coins():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 200,
-        "page": 1,
-        "sparkline": "false"
-    }
-    response = requests.get(url, params=params)
-    return response.json()
+# === MEMORY ===
+sent_signals = {}
 
-def check_signal():
-    coins = get_coins()
-    for coin in coins:
-        try:
-            symbol = coin["symbol"].upper()
-            price = coin["current_price"]
-            ath = coin["ath"]
-            vol = coin["total_volume"]
-            cap = coin["market_cap"]
-            markets = coin.get("platforms", {})
+# === INDICATORS ===
+def calculate_ema(prices, period):
+    return np.convolve(prices, np.ones(period)/period, mode='valid')
 
-            if (
-                price <= 3 and
-                ath > 0 and
-                vol >= 1_000_000 and
-                cap >= 5_000_000 and
-                "kraken" in coin["name"].lower() or
-                "mexc" in coin["name"].lower() or
-                "bybit" in coin["name"].lower()
-            ):
-                drop = (ath - price) / ath
-                if drop >= 0.75:
-                    tp1 = round(price * 1.272, 6)
-                    tp2 = round(price * 1.618, 6)
-                    tp3 = round(price * 2.0, 6)
-                    tp4 = round(price * 2.618, 6)
-                    rr = round((tp2 - price) / (price * 0.05), 1)
+def calculate_rsi(prices, period=14):
+    deltas = np.diff(prices)
+    up = deltas.clip(min=0)
+    down = -deltas.clip(max=0)
+    avg_gain = np.convolve(up, np.ones(period)/period, mode='valid')
+    avg_loss = np.convolve(down, np.ones(period)/period, mode='valid')
+    rs = avg_gain / (avg_loss + 1e-6)
+    return 100 - (100 / (1 + rs))
 
-                    tags = []
-                    if drop >= 0.95:
-                        tags.append("🚨 ULTRA DROP")
-                    if tp4 >= price * 3:
-                        tags.append("🚀 HIGH POTENTIAL")
+def calculate_bb(prices, period=20, std_dev=2):
+    ma = np.convolve(prices, np.ones(period)/period, mode='valid')
+    std = np.std(prices[-period:])
+    upper = ma[-1] + std_dev * std
+    lower = ma[-1] - std_dev * std
+    return upper, lower
 
-                    msg = f"""🟢 <b>BUY SIGNAL</b> — {symbol}
-💰 Цена: ${price}
-📉 Падение от ATH: {round(drop*100)}%
-🎯 Цели:
-• TP1: ${tp1}
-• TP2: ${tp2}
-• TP3: ${tp3}
-• TP4: ${tp4}
-⚖️ R/R ≈ {rr}:1
-📊 Объём: ${vol:,.0f}
-🏷️ {' | '.join(tags) if tags else '—'}"""
+# === SIGNAL LOGIC ===
+def check_for_signals():
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 200,
+            "page": 1,
+            "price_change_percentage": "24h"
+        }
+        data = requests.get(url, params=params).json()
 
-                    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
-        except Exception as e:
-            print(f"❌ Ошибка при обработке {coin.get('id', '')}: {e}")
+        for coin in data:
+            try:
+                symbol = coin['symbol'].upper()
+                price = coin['current_price']
+                cap = coin['market_cap']
+                vol = coin['total_volume']
+                exchanges = [ex.lower() for ex in coin.get("platforms", {}).keys()]
+                if price > 3 or cap < 5_000_000 or vol < 1_000_000:
+                    continue
+                if not any(x in exchanges for x in ['kraken', 'mexc', 'bybit']):
+                    continue
+                if symbol in ["USDT", "USDC", "BUSD", "DAI", "TUSD"]:
+                    continue
 
-def run_loop():
+                klines = requests.get(
+                    f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval=1h&limit=100"
+                ).json()
+                closes = [float(c[4]) for c in klines]
+                if len(closes) < 50:
+                    continue
+
+                ema21 = calculate_ema(closes, 21)
+                ema50 = calculate_ema(closes, 50)
+                rsi = calculate_rsi(closes)[-1]
+                upper, lower = calculate_bb(closes)
+
+                last = closes[-1]
+                prev = closes[-2]
+                volume = float(klines[-1][5])
+                prev_volume = float(klines[-2][5])
+
+                # === CONFIRMED V-REVERSAL CONDITIONS ===
+                if (
+                    last > ema21[-1] > ema50[-1] and
+                    last > prev and
+                    volume > prev_volume and
+                    rsi > 35 and
+                    last > lower
+                ):
+                    stop = round(last * 0.97, 6)
+                    tp1 = round(last * 1.1, 6)
+                    tp2 = round(last * 1.3, 6)
+                    tp3 = round(last * 1.6, 6)
+                    tp4 = round(last * 2.0, 6)
+                    rr = round((tp4 - last) / (last - stop), 1)
+                    if rr < 3:
+                        continue
+                    if sent_signals.get(symbol):
+                        continue
+                    message = (
+                        f"✅ BUY сигнал по монете {symbol}\n"
+                        f"Цена входа: ${last}\n"
+                        f"Стоп: ${stop}\n"
+                        f"TP1: {tp1}\nTP2: {tp2}\nTP3: {tp3}\nTP4: {tp4}\n"
+                        f"R/R = {rr}:1\n"
+                        f"https://www.coingecko.com/en/coins/{coin['id']}"
+                    )
+                    bot.send_message(chat_id=CHAT_ID, text=message)
+                    sent_signals[symbol] = True
+            except Exception:
+                continue
+    except Exception as e:
+        print("❌ Ошибка анализа:", e)
+
+# === RUN LOOP ===
+def run_bot():
     while True:
-        check_signal()
+        check_for_signals()
         time.sleep(180)
 
+# === START ===
 if __name__ == "__main__":
-    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 8080}).start()
-    run_loop()
+    print("🚀 Бот запущен")
+    bot.send_message(chat_id=CHAT_ID, text="🤖 Бот на V-разворот запущен!")
+    threading.Thread(target=run_bot).start()
+    app.run(host="0.0.0.0", port=10000)
