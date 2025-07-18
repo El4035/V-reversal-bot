@@ -1,121 +1,82 @@
-import requests
-import time
-import csv
-from flask import Flask
-from threading import Thread
 
-# Telegram
-TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
-CHAT_ID = 944484522
-TG_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+✅ Финальный main.py для V-Разворот бота (с расчётом RSI, EMA, BB и подтверждением второй волны)
 
-# Файл логов
-LOG_FILE = "signals_log.csv"
+import requests import time import math import numpy as np from flask import Flask from telegram import Bot from datetime import datetime
 
-# Инициализация Flask
-app = Flask(__name__)
+TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y" CHAT_ID = 944484522 bot = Bot(token=TOKEN) app = Flask(name)
 
-@app.route('/')
-def home():
-    return "✅ V-Reversal bot is running!"
+SYMBOL = "WIFUSDT" INTERVAL = "1h" LIMIT = 100 API_URL = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit={LIMIT}"
 
-def send_telegram_message(text):
-    try:
-        requests.post(TG_URL, data={"chat_id": CHAT_ID, "text": text})
-    except Exception as e:
-        print("Telegram error:", e)
+sent_buy_signals = set()
 
-def save_signal_log(data):
-    with open(LOG_FILE, "a", newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(data)
+📊 Расчёт EMA
 
-def check_signals():
-    while True:
-        try:
-            # Получение монет с CoinGecko
-            url = "https://api.coingecko.com/api/v3/coins/markets"
-            params = {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": 200,
-                "page": 1,
-                "sparkline": "false"
-            }
-            response = requests.get(url, params=params).json()
+def calculate_ema(values, period): ema = [] k = 2 / (period + 1) for i in range(len(values)): if i < period: ema.append(np.mean(values[:i+1])) else: ema.append(values[i] * k + ema[i - 1] * (1 - k)) return ema
 
-            for coin in response:
-                try:
-                    # Фильтры
-                    price = coin['current_price']
-                    volume = coin['total_volume']
-                    market_cap = coin['market_cap']
-                    ath = coin['ath']
-                    ath_change = (price - ath) / ath * 100
-                    name = coin['name']
-                    symbol = coin['symbol'].upper()
-                    id = coin['id']
-                    exchanges = ['kraken', 'mexc', 'bybit']
-                    listed = [e for e in exchanges if e in [m['market']['name'].lower() for m in requests.get(f"https://api.coingecko.com/api/v3/coins/{id}/tickers").json()['tickers']]]
+📉 Расчёт RSI
 
-                    if price > 3 or volume < 1_000_000 or market_cap < 5_000_000:
-                        continue
-                    if "usd" in symbol.lower() or any(bad in symbol.lower() for bad in ["scam", "pig", "turd"]):
-                        continue
+def calculate_rsi(closes, period=14): gains, losses = [], [] for i in range(1, len(closes)): delta = closes[i] - closes[i - 1] gains.append(max(delta, 0)) losses.append(abs(min(delta, 0))) avg_gain = np.mean(gains[:period]) avg_loss = np.mean(losses[:period]) rsis = [] for i in range(period, len(gains)): avg_gain = (avg_gain * (period - 1) + gains[i]) / period avg_loss = (avg_loss * (period - 1) + losses[i]) / period rs = avg_gain / avg_loss if avg_loss != 0 else 0 rsis.append(100 - (100 / (1 + rs))) return rsis
 
-                    # Проверка падения от ATH
-                    if ath > 0 and ath_change <= -80:
-                        # Расчёт целей
-                        tp1 = round(price * 1.272, 4)
-                        tp2 = round(price * 1.618, 4)
-                        tp3 = round(price * 2.0, 4)
-                        tp4 = round(price * 2.618, 4)
-                        stop = round(price * 0.97, 4)  # стоп = -3%
-                        rr = round((tp4 - price) / (price - stop), 1)
+📉 Расчёт нижней полосы BB
 
-                        if rr < 3:
-                            continue
+def calculate_bb_lower(closes, period=20): bb_lower = [] for i in range(period, len(closes)): mean = np.mean(closes[i - period:i]) std = np.std(closes[i - period:i]) bb_lower.append(mean - 2 * std) return bb_lower
 
-                        # High Potential?
-                        tag = "🔥 High Potential!" if tp4 >= price * 3 else ""
+✅ Основная проверка BUY сигнала (вторая волна)
 
-                        # Сообщение
-                        message = (
-                            f"📈 BUY сигнал на разворот\n"
-                            f"🔹 Coin: {name} (${symbol})\n"
-                            f"💰 Цена: ${price}\n"
-                            f"📉 Падение от ATH: {round(ath_change, 2)}%\n"
-                            f"🎯 TP1: ${tp1}\n"
-                            f"🎯 TP2: ${tp2}\n"
-                            f"🎯 TP3: ${tp3}\n"
-                            f"🎯 TP4: ${tp4}\n"
-                            f"🛑 Стоп: ${stop}\n"
-                            f"⚖️ R/R: {rr}:1\n"
-                            f"📊 Биржи: {', '.join(listed)}\n"
-                            f"{tag}"
-                        )
+def is_confirmed_buy(candles): closes = [float(c[4]) for c in candles] lows = [float(c[3]) for c in candles] volumes = [float(c[5]) for c in candles]
 
-                        send_telegram_message(message)
-                        save_signal_log([name, symbol, price, stop, tp1, tp2, tp3, tp4, rr, tag])
-                        time.sleep(1)
+if len(closes) < 60:
+    return False, None
 
-                except Exception as e:
-                    print("Ошибка при проверке монеты:", e)
+ema21 = calculate_ema(closes, 21)
+ema50 = calculate_ema(closes, 50)
+rsi = calculate_rsi(closes, 14)
+bb_lower = calculate_bb_lower(closes, 20)
 
-        except Exception as e:
-            print("Ошибка основного цикла:", e)
+last_close = closes[-1]
+last_low = lows[-1]
+last_volume = volumes[-1]
+avg_volume = np.mean(volumes[-20:])
 
-        time.sleep(180)
+# Условия:
+if last_volume < avg_volume * 1.2:
+    return False, None  # Нет всплеска объёма
+if last_close < ema21[-1] or last_close < ema50[-1]:
+    return False, None  # Цена не выше EMA21/50
+if last_low > bb_lower[-1]:
+    return False, None  # Нет касания нижней BB
+if rsi[-1] < rsi[-2]:
+    return False, None  # RSI не растёт
 
-def start_bot():
-    send_telegram_message("🤖 Бот на V‑разворот запущен!")
-    check_signals()
+entry = last_close
+stop = min(lows[-5:]) * 0.995
+rr = (entry * 2.618 - entry) / (entry - stop)
 
-# Запуск бота в потоке
-t = Thread(target=start_bot)
-t.daemon = True
-t.start()
+if rr < 3:
+    return False, None
 
-# Запуск сервера Flask
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+tp1 = round(entry * 1.272, 5)
+tp2 = round(entry * 1.618, 5)
+tp3 = round(entry * 2.0, 5)
+tp4 = round(entry * 2.618, 5)
+
+return True, {
+    "entry": entry,
+    "stop": round(stop, 5),
+    "tp1": tp1,
+    "tp2": tp2,
+    "tp3": tp3,
+    "tp4": tp4,
+    "rr": round(rr, 2)
+}
+
+🔁 Основной цикл проверки
+
+@app.route('/') def home(): return "✅ V-Reversal bot is alive"
+
+def check_signal(): try: candles = requests.get(API_URL).json() if not candles or len(candles) < 60: return is_buy, data = is_confirmed_buy(candles) if is_buy: signal_id = f"{SYMBOL}_{data['entry']}" if signal_id in sent_buy_signals: return sent_buy_signals.add(signal_id) message = ( f"✅ BUY сигнал по {SYMBOL}\n" f"Цена входа: {data['entry']}\n" f"Stop: {data['stop']}\n" f"TP1: {data['tp1']}\n" f"TP2: {data['tp2']}\n" f"TP3: {data['tp3']}\n" f"TP4: {data['tp4']}\n" f"R/R: {data['rr']}:1" ) bot.send_message(chat_id=CHAT_ID, text=message) except Exception as e: print(f"❌ Ошибка: {e}")
+
+🚀 Запуск
+
+if name == 'main': print("🤖 Бот запущен!") bot.send_message(chat_id=CHAT_ID, text="🤖 Бот на V-разворот запущен!") while True: check_signal() time.sleep(180) app.run(host='0.0.0.0', port=8080)
+
