@@ -1,5 +1,7 @@
+
 flask
 requests
 python-dotenv
 pandas
 gunicorn
+python-telegram-bot==13.15
