@@ -1,8 +1,11 @@
-import time
+# main.py (финальная версия, 154 строки)
 import requests
-from telegram import Bot
 from flask import Flask
-from threading import Thread
+from telegram import Bot
+import time
+import threading
+import datetime
+import math
 
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
@@ -10,136 +13,186 @@ bot = Bot(token=TOKEN)
 
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "✅ V-Reversal бот активен!"
+SENT_IDS = set()
 
-def send_message(message):
+def send_signal(message):
     try:
         bot.send_message(chat_id=CHAT_ID, text=message)
+        print("✅ Сигнал отправлен")
     except Exception as e:
-        print(f"❌ Ошибка отправки Telegram: {e}")
-
-def calculate_rsi(closes, period=14):
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        delta = closes[i] - closes[i - 1]
-        (gains if delta > 0 else losses).append(abs(delta))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period or 1e-10
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_ema(data, period):
-    k = 2 / (period + 1)
-    ema = data[0]
-    for price in data[1:]:
-        ema = price * k + ema * (1 - k)
-    return ema
-
-def calculate_bollinger_bands(closes, period=20, std_dev=2):
-    ma = sum(closes) / period
-    variance = sum((c - ma) ** 2 for c in closes) / period
-    std = variance ** 0.5
-    return ma + std_dev * std, ma, ma - std_dev * std
-
-def fetch_candles(symbol, interval='1h', limit=100):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    r = requests.get(url)
-    return [[float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in r.json()]
+        print(f"❌ Ошибка Telegram: {e}")
 
 def get_top_coins():
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
-        'vs_currency': 'usd',
-        'order': 'market_cap_desc',
-        'per_page': 200,
-        'page': 1
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 200,
+        "page": 1,
+        "sparkline": "false"
     }
-    response = requests.get(url).json()
-    allowed_exchanges = ["kraken", "mexc", "bybit"]
-    stablecoins = ["USD", "USDT", "BUSD", "DAI", "TUSD"]
-    blacklist = ["SCAM", "PIG", "TURD"]
+    try:
+        response = requests.get(url, params=params)
+        return response.json()
+    except Exception as e:
+        print(f"Ошибка при получении списка монет: {e}")
+        return []
 
-    filtered = []
-    for coin in response:
-        if (
-            coin["current_price"] <= 3 and
-            coin["total_volume"] >= 1_000_000 and
-            coin["market_cap"] and coin["market_cap"] >= 5_000_000 and
-            not any(stable in coin["symbol"].upper() for stable in stablecoins) and
-            coin["symbol"].upper() not in blacklist and
-            any(ex in [e["name"].lower() for e in coin.get("tickers", [])] for ex in allowed_exchanges)
-        ):
-            filtered.append(coin)
-    return filtered
+def get_ohlcv(coin_id):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {
+        "vs_currency": "usd",
+        "days": "4",
+        "interval": "hourly"
+    }
+    try:
+        response = requests.get(url, params=params)
+        data = response.json()
+        prices = data["prices"]
+        volumes = data["total_volumes"]
+        return prices, volumes
+    except Exception as e:
+        print(f"Ошибка при получении OHLCV: {e}")
+        return [], []
+
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        diff = prices[i][1] - prices[i - 1][1]
+        if diff >= 0:
+            gains.append(diff)
+        else:
+            losses.append(abs(diff))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
+
+def calculate_ema(prices, period):
+    k = 2 / (period + 1)
+    ema = prices[0][1]
+    for price in prices[1:]:
+        ema = price[1] * k + ema * (1 - k)
+    return ema
+
+def calculate_bb(prices, period=20):
+    if len(prices) < period:
+        return None, None
+
+    closes = [p[1] for p in prices[-period:]]
+    mean = sum(closes) / period
+    variance = sum((c - mean) ** 2 for c in closes) / period
+    std = math.sqrt(variance)
+    lower = mean - 2 * std
+    upper = mean + 2 * std
+    return lower, upper
 
 def analyze_coin(coin):
-    symbol = coin["symbol"].upper() + "USDT"
-    try:
-        candles = fetch_candles(symbol)
-    except:
+    coin_id = coin["id"]
+    symbol = coin["symbol"].upper()
+    name = coin["name"]
+    current_price = coin["current_price"]
+    volume = coin["total_volume"]
+    market_cap = coin["market_cap"]
+
+    if current_price > 3 or volume < 1_000_000 or market_cap < 5_000_000:
         return
 
-    closes = [c[4] for c in candles]
-    volumes = [c[5] for c in candles]
-    lows = [c[2] for c in candles]
-
-    if len(closes) < 21:
+    if any(x in symbol for x in ["USD", "USDT", "BUSD", "DAI", "TUSD"]):
         return
 
-    rsi = calculate_rsi(closes[-15:])
-    ema21 = calculate_ema(closes[-21:], 21)
-    ema50 = calculate_ema(closes[-50:], 50)
-    bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes[-20:])
+    blacklist = ["SCAM", "PIG", "TURD"]
+    if symbol in blacklist:
+        return
 
-    last_close = closes[-1]
-    prev_close = closes[-2]
-    last_low = lows[-1]
-    prev_low = lows[-2]
-    vol = volumes[-1]
+    allowed_exchanges = ["kraken", "mexc", "bybit"]
+    tickers_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/tickers"
+    tickers = requests.get(tickers_url).json().get("tickers", [])
+    if not any(t["market"]["identifier"] in allowed_exchanges for t in tickers):
+        return
 
-    # Условия сигнала второй волны V-разворота
-    if (
-        rsi < 35 and
-        last_close > prev_close and
-        last_low < bb_lower and
-        last_close > ema21 > ema50 and
-        vol > sum(volumes[-10:]) / 10  # объём выше среднего
-    ):
-        entry = last_close
-        stop = min(prev_low, bb_lower)
-        rr = round((entry - stop) / (entry * 0.01), 1)
-        if rr < 3:
-            return
+    prices, volumes = get_ohlcv(coin_id)
+    if not prices or not volumes:
+        return
 
-        tp1 = round(entry * 1.1, 4)
-        tp2 = round(entry * 1.272, 4)
-        tp3 = round(entry * 1.618, 4)
-        tp4 = round(entry * 2.0, 4)
+    recent_price = prices[-1][1]
+    rsi = calculate_rsi(prices[-15:])
+    ema21 = calculate_ema(prices[-21:], 21)
+    ema50 = calculate_ema(prices[-50:], 50)
+    bb_low, bb_high = calculate_bb(prices)
 
-        msg = (
-            f"📈 <b>V-Reversal BUY сигнал</b>\n"
-            f"Монета: <b>{coin['name']} ({symbol})</b>\n"
-            f"Цена входа: ${entry:.4f}\n"
-            f"Stop-Loss: ${stop:.4f}\n"
-            f"TP1: ${tp1} | TP2: ${tp2}\n"
-            f"TP3: ${tp3} | TP4: ${tp4}\n"
-            f"R/R: {rr}:1\n"
-            f"Объём: {round(vol, 0)}"
-        )
-        send_message(msg)
+    if not all([rsi, ema21, ema50, bb_low]):
+        return
+
+    if rsi > 35 or recent_price > bb_low:
+        return
+
+    if not (recent_price > ema21 > ema50):
+        return
+
+    recent_volume = volumes[-1][1]
+    previous_volume = volumes[-2][1]
+    if recent_volume < previous_volume * 1.5:
+        return
+
+    support = min(p[1] for p in prices[-10:])
+    entry = recent_price
+    stop = support
+    rr = round((entry - stop) / (entry * 0.03), 1)
+
+    if rr < 3:
+        return
+
+    tp1 = round(entry * 1.1, 4)
+    tp2 = round(entry * 1.2, 4)
+    tp3 = round(entry * 1.5, 4)
+    tp4 = round(entry * 2.0, 4)
+
+    key = f"{symbol}_{round(entry, 4)}"
+    if key in SENT_IDS:
+        return
+
+    SENT_IDS.add(key)
+    message = (
+        f"🟢 <b>BUY сигнал (V‑разворот)</b>\n\n"
+        f"<b>{name} ({symbol})</b>\n"
+        f"Цена: ${entry:.4f}\n"
+        f"Stop: ${stop:.4f}\n"
+        f"TP1: ${tp1}\n"
+        f"TP2: ${tp2}\n"
+        f"TP3: ${tp3}\n"
+        f"TP4: ${tp4}\n"
+        f"R/R: {rr}:1\n\n"
+        f"https://www.coingecko.com/en/coins/{coin_id}"
+    )
+    send_signal(message)
 
 def run_bot():
-    send_message("🤖 V-Reversal бот запущен и работает!")
+    send_signal("🤖 Бот V‑разворота запущен!")
     while True:
         try:
             coins = get_top_coins()
             for coin in coins:
                 analyze_coin(coin)
         except Exception as e:
-            print("Ошибка:", e)
+            print(f"Ошибка при сканировании монет: {e}")
         time.sleep(180)
 
-Thread(target=run_bot).start()
-Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 10000}).start()
+@app.route('/')
+def home():
+    return "✅ I'm alive!"
+
+if __name__ == '__main__':
+    t = threading.Thread(target=run_bot)
+    t.start()
+    app.run(host='0.0.0.0', port=10000)
