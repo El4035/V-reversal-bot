@@ -1,128 +1,91 @@
+
 import requests
 import time
-import pandas as pd
-from flask import Flask
+import math
 from telegram import Bot
+from flask import Flask
+import threading
 
-# Telegram настройки
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
 bot = Bot(token=TOKEN)
 
-# Flask-сервер для Render
+# ✅ Тестовое сообщение — УДАЛИ после проверки
+bot.send_message(chat_id=CHAT_ID, text="✅ Тестовое сообщение: бот работает!")
+
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "V-reversal bot is running"
+    return "I'm alive!"
 
-# Память сигналов, чтобы не дублировались
-sent_signals = set()
-
-# Получить свечи с Binance
-def get_klines(symbol, interval="1h", limit=100):
-    url = f"https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    response = requests.get(url, params=params)
-    data = response.json()
-    df = pd.DataFrame(data, columns=[
-        "time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "num_trades", "taker_base_vol", "taker_quote_vol", "ignore"
-    ])
-    df["close"] = df["close"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["open"] = df["open"].astype(float)
-    df["volume"] = df["volume"].astype(float)
-    return df
-
-# Индикаторы
-def calculate_indicators(df):
-    df["EMA21"] = df["close"].ewm(span=21).mean()
-    df["EMA50"] = df["close"].ewm(span=50).mean()
-    df["RSI"] = compute_rsi(df["close"], 14)
-    df["BB_MID"] = df["close"].rolling(window=20).mean()
-    df["BB_STD"] = df["close"].rolling(window=20).std()
-    df["BB_LOW"] = df["BB_MID"] - 2 * df["BB_STD"]
-    return df
-
-# RSI вручную
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-# Проверка второй волны
-def check_second_wave(df):
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    vol_increased = latest["volume"] > df["volume"].rolling(10).mean().iloc[-1] * 1.5
-    candle = latest["close"] > latest["open"]
-    bb_break = prev["close"] < prev["BB_LOW"] and latest["close"] > latest["BB_LOW"]
-    ema_cross = latest["close"] > latest["EMA21"] > latest["EMA50"]
-    rsi_conver = latest["RSI"] > prev["RSI"]
-
-    return all([vol_increased, candle, bb_break, ema_cross, rsi_conver])
-
-# Основная логика
-def scan_coins():
+def get_coins():
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "per_page": 200,
         "page": 1,
-        "sparkline": False
+        "sparkline": "false"
     }
-    response = requests.get(url)
-    coins = response.json()
+    response = requests.get(url, params=params)
+    return response.json()
 
+def check_signal():
+    coins = get_coins()
     for coin in coins:
-        symbol = coin["symbol"].upper()
-        if "USD" in symbol or coin["current_price"] > 3:
-            continue
-        if coin["market_cap"] < 5_000_000 or coin["total_volume"] < 1_000_000:
-            continue
-
-        if not any(ex in coin["platforms"] for ex in ["kraken", "mexc", "bybit"]):
-            continue
-
         try:
-            binance_symbol = symbol + "USDT"
-            df = get_klines(binance_symbol)
-            df = calculate_indicators(df)
+            symbol = coin["symbol"].upper()
+            price = coin["current_price"]
+            ath = coin["ath"]
+            vol = coin["total_volume"]
+            cap = coin["market_cap"]
+            markets = coin.get("platforms", {})
 
-            if check_second_wave(df):
-                entry = df["close"].iloc[-1]
-                stop = df["low"].rolling(5).min().iloc[-1]
-                rr = (entry - stop) * 3 + entry
+            if (
+                price <= 3 and
+                ath > 0 and
+                vol >= 1_000_000 and
+                cap >= 5_000_000 and
+                "kraken" in coin["name"].lower() or
+                "mexc" in coin["name"].lower() or
+                "bybit" in coin["name"].lower()
+            ):
+                drop = (ath - price) / ath
+                if drop >= 0.75:
+                    tp1 = round(price * 1.272, 6)
+                    tp2 = round(price * 1.618, 6)
+                    tp3 = round(price * 2.0, 6)
+                    tp4 = round(price * 2.618, 6)
+                    rr = round((tp2 - price) / (price * 0.05), 1)
 
-                msg_id = f"{symbol}_{round(entry, 4)}"
-                if msg_id in sent_signals:
-                    continue
-                sent_signals.add(msg_id)
+                    tags = []
+                    if drop >= 0.95:
+                        tags.append("🚨 ULTRA DROP")
+                    if tp4 >= price * 3:
+                        tags.append("🚀 HIGH POTENTIAL")
 
-                text = f"""
-🟢 BUY signal for {symbol}
-Entry: {entry:.4f}
-Stop: {stop:.4f}
-TP1: {(entry * 1.272):.4f}
-TP2: {(entry * 1.618):.4f}
-TP3: {(entry * 2.0):.4f}
-TP4: {(entry * 2.618):.4f}
-R/R ≈ 3:1
-"""
-                bot.send_message(chat_id=CHAT_ID, text=text.strip())
+                    msg = f"""🟢 <b>BUY SIGNAL</b> — {symbol}
+💰 Цена: ${price}
+📉 Падение от ATH: {round(drop*100)}%
+🎯 Цели:
+• TP1: ${tp1}
+• TP2: ${tp2}
+• TP3: ${tp3}
+• TP4: ${tp4}
+⚖️ R/R ≈ {rr}:1
+📊 Объём: ${vol:,.0f}
+🏷️ {' | '.join(tags) if tags else '—'}"""
+
+                    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
         except Exception as e:
-            print(f"❌ Error for {symbol}: {e}")
+            print(f"❌ Ошибка при обработке {coin.get('id', '')}: {e}")
 
-# Запуск
-print("Bot zapushchen i rabotaet!")
+def run_loop():
+    while True:
+        check_signal()
+        time.sleep(180)
 
-scan_coins()
-
+if __name__ == "__main__":
+    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 8080}).start()
+    run_loop()
