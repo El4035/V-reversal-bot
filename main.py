@@ -1,170 +1,182 @@
-
 import requests
 import time
-import datetime
+from telegram import Bot
 from flask import Flask
 import threading
 import math
-import os
 
-# Telegram
+# ==== НАСТРОЙКИ ====
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
-CHAT_ID = "944484522"
+CHAT_ID = 944484522
+bot = Bot(token=TOKEN)
 
-# Flask-сервер для Render
+USE_BE_READY_FILTER = False  # Можно включать True, если нужно фильтровать BUY по 4H
+MAX_PRICE = 5.0  # Лимит цены монеты
+
 app = Flask(__name__)
+sent_signals = set()
 
-@app.route('/')
+# ==== ЗАПУСК FLASK ДЛЯ Render ====
+@app.route("/")
 def home():
-    return "V-Bot is alive!"
+    return "✅ Бот V-разворота активен!"
 
 def run_flask():
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host="0.0.0.0", port=10000)
 
-# Параметры
-VS_CURRENCY = "usd"
-EXCHANGES = ["kraken", "mexc", "bybit"]
-MIN_VOLUME = 1_000_000
-MIN_CAP = 5_000_000
-MAX_PRICE = 3.0
-DROP_THRESHOLD = 75  # от ATH
-MIN_RR = 3.0
+# ==== Binance API: Сбор свечей ====
+def get_klines(symbol, interval, limit=100):
+    url = f"https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    response = requests.get(url)
+    return response.json()
 
-signal_history = set()
-
-def get_top_coins():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "order": "market_cap_desc",
-        "per_page": 200,
-        "page": 1,
-        "sparkline": False
-    }
-    try:
-        response = requests.get(url, params=params)
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка при получении списка монет: {e}")
-        return []
-
-def get_ohlcv(coin_id):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {
-        "vs_currency": VS_CURRENCY,
-        "days": "1",
-        "interval": "hourly"
-    }
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        prices = data.get("prices", [])
-        volumes = data.get("total_volumes", [])
-        if len(prices) >= 20 and len(volumes) >= 20:
-            return prices[-20:], volumes[-20:]
-        return [], []
-    except:
-        return [], []
-
-def calculate_rsi(prices):
-    gains = []
-    losses = []
-    for i in range(1, len(prices)):
-        delta = prices[i][1] - prices[i-1][1]
-        if delta >= 0:
-            gains.append(delta)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(delta))
-    avg_gain = sum(gains) / len(gains)
-    avg_loss = sum(losses) / len(losses) + 1e-6
+# ==== RSI ====
+def calculate_rsi(closes, period=14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def check_coin(coin):
+# ==== EMA ====
+def calculate_ema(data, period):
+    k = 2 / (period + 1)
+    ema = sum(data[:period]) / period
+    for price in data[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+# ==== BBANDS ====
+def calculate_bbands(closes, period=20, std_dev=2):
+    ma = sum(closes[-period:]) / period
+    variance = sum((c - ma) ** 2 for c in closes[-period:]) / period
+    std = math.sqrt(variance)
+    upper = ma + std_dev * std
+    lower = ma - std_dev * std
+    return upper, ma, lower
+
+# ==== Скан монеты ====
+def analyze_symbol(symbol, interval):
     try:
-        if coin["current_price"] > MAX_PRICE: return
-        if coin["total_volume"] < MIN_VOLUME: return
-        if coin["market_cap"] < MIN_CAP: return
-        if not any(ex in coin["platforms"].values() for ex in EXCHANGES): return
-        ath = coin.get("ath", 0)
-        if ath == 0: return
-        drop = ((ath - coin["current_price"]) / ath) * 100
-        if drop < DROP_THRESHOLD: return
+        klines = get_klines(symbol, interval, 100)
+        closes = [float(k[4]) for k in klines]
+        lows = [float(k[3]) for k in klines]
+        highs = [float(k[2]) for k in klines]
+        volumes = [float(k[5]) for k in klines]
+        last_close = closes[-1]
 
-        prices, volumes = get_ohlcv(coin["id"])
-        if not prices or not volumes: return
+        rsi = calculate_rsi(closes)
+        ema21 = calculate_ema(closes, 21)
+        upper, middle, lower = calculate_bbands(closes)
 
-        rsi = calculate_rsi(prices)
+        # Объём и структура
+        support_level = min(lows[-10:])
+        resistance_level = max(highs[-10:])
+        recent_volume = volumes[-1]
+        avg_volume = sum(volumes[-20:]) / 20
+
+        # Фильтры на BUY
         if rsi > 35: return
+        if last_close > lower: return
+        if last_close < ema21: return
+        if recent_volume < avg_volume: return
+        if last_close < support_level * 0.98: return
 
-        # Проверка второй волны (подтверждённый разворот)
-        close_now = prices[-1][1]
-        close_prev = prices[-2][1]
-        if close_now < close_prev: return
+        # R/R проверка
+        stop = support_level * 0.99
+        tp = resistance_level * 1.02
+        rr = (tp - last_close) / (last_close - stop)
+        if rr < 3: return
 
-        vol_now = volumes[-1][1]
-        avg_vol = sum([v[1] for v in volumes[:-1]]) / len(volumes[:-1])
-        if vol_now < avg_vol * 1.5: return
+        # Тип сигнала
+        if interval == "4h":
+            signal_type = "be ready"
+        else:
+            if USE_BE_READY_FILTER:
+                return  # ← можно позже доработать фильтр по 4H
+            signal_type = "BUY"
 
-        if prices[-1][1] < prices[-2][1] or rsi < 20: return
+        signal_id = f"{symbol}_{interval}_{signal_type}"
+        if signal_id in sent_signals:
+            return
+        sent_signals.add(signal_id)
 
-        entry = round(prices[-1][1], 6)
-        stop = round(entry * 0.97, 6)
-        tp1 = round(entry * 1.272, 6)
-        tp2 = round(entry * 1.618, 6)
-        tp3 = round(entry * 2.0, 6)
-        tp4 = round(entry * 2.618, 6)
-        rr = round((tp4 - entry) / (entry - stop), 1)
-        if rr < MIN_RR: return
-
-        key = f"{coin['symbol']}_{entry}"
-        if key in signal_history: return
-        signal_history.add(key)
-
-        msg = (
-            f"📈 <b>BUY сигнал (V-разворот)</b>\n\n"
-            f"🪙 <b>{coin['name'].upper()}</b> ({coin['symbol'].upper()})\n"
-            f"💰 Цена входа: <b>${entry}</b>\n"
-            f"🛑 Стоп: <b>${stop}</b>\n"
-            f"🎯 TP1: ${tp1}\n🎯 TP2: ${tp2}\n🎯 TP3: ${tp3}\n🎯 TP4: ${tp4}\n"
-            f"⚖️ R/R: <b>{rr}:1</b>\n"
-            f"📊 Объём: ${coin['total_volume']:,}\n"
-            f"📉 Падение от ATH: {round(drop)}%\n"
-            f"📅 Время: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
-            f"🌐 https://www.coingecko.com/en/coins/{coin['id']}"
+        # Отправка в Telegram
+        text = (
+            f"📊 <b>{signal_type.upper()}</b> на <b>{interval}</b> для <b>{symbol}</b>\n"
+            f"💰 Entry: <b>{round(last_close, 5)}</b>\n"
+            f"📉 Stop: <b>{round(stop, 5)}</b>\n"
+            f"🎯 Target: <b>{round(tp, 5)}</b>\n"
+            f"📈 R/R: <b>{round(rr, 2)}:1</b>\n"
+            f"#Vreversal #Crypto #Signal"
         )
-        send_telegram(msg)
-        log_signal(coin["symbol"], entry, stop, tp4, rr)
+        bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+
     except Exception as e:
-        print(f"Ошибка при проверке монеты {coin['id']}: {e}")
+        print(f"Ошибка при анализе {symbol} ({interval}): {e}")
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print("Ошибка отправки в Telegram:", e)
+# ==== Получение списка монет с CoinGecko ====
+def get_top_symbols():
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 200,
+        "page": 1
+    }
+    response = requests.get(url)
+    data = response.json()
 
-def log_signal(symbol, entry, stop, tp4, rr):
-    try:
-        with open("signals_log.csv", "a") as f:
-            f.write(f"{datetime.datetime.utcnow()},{symbol},{entry},{stop},{tp4},{rr}\n")
-    except:
-        pass
+    symbols = []
+    for coin in data:
+        price = coin["current_price"]
+        volume = coin["total_volume"]
+        cap = coin["market_cap"]
+        name = coin["symbol"].upper()
+        exchanges = coin.get("platforms", {})
 
+        if price is None or price > MAX_PRICE: continue
+        if volume < 1_000_000 or cap < 5_000_000: continue
+        if any(x in name for x in ["USD", "USDT", "BUSD", "DAI", "TUSD"]): continue
+        if name in ["SCAM", "PIG", "TURD"]: continue
+
+        # Биржи (упрощённо)
+        listed_on = ",".join(exchanges.keys()).lower()
+        if not any(x in listed_on for x in ["kraken", "mexc", "bybit"]): continue
+
+        binance_symbol = name + "USDT"
+        symbols.append(binance_symbol)
+
+    return symbols
+
+# ==== Основной цикл ====
 def main_loop():
-    while True:
-        coins = get_top_coins()
-        for coin in coins:
-            check_coin(coin)
-        time.sleep(180)
+    try:
+        bot.send_message(chat_id=CHAT_ID, text="🤖 Бот запущен: V-разворот активен!")
+    except:
+        print("Telegram бот не отвечает")
 
-# Запуск
+    while True:
+        try:
+            symbols = get_top_symbols()
+            intervals = ["15m", "1h", "4h"]
+            for symbol in symbols:
+                for interval in intervals:
+                    analyze_symbol(symbol, interval)
+            time.sleep(180)
+        except Exception as e:
+            print("⛔ Ошибка в основном цикле:", e)
+            time.sleep(60)
+
+# ==== Запуск ====
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    send_telegram("🤖 Бот V-РАЗВОРОТ запущен!")
     main_loop()
 
