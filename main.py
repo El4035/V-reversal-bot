@@ -1,12 +1,12 @@
 import requests
 import time
 from flask import Flask
-from telegram import Bot
+import telebot
 import math
 
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
-bot = Bot(token=TOKEN)
+bot = telebot.TeleBot(TOKEN)
 
 app = Flask(__name__)
 
