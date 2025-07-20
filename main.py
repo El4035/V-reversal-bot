@@ -1,7 +1,5 @@
+import os
 import requests
-import time
-import math
-from datetime import datetime
 from flask import Flask
 from telegram import Bot
 
