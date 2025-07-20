@@ -1,24 +1,31 @@
+import requests
 import time
 import threading
-import requests
 from flask import Flask
-from telegram import Bot
 
-# --- Telegram настройки ---
-TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
-CHAT_ID = 944484522
-bot = Bot(token=TOKEN)
+# --- Telegram конфиг ---
+TOKEN = '8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y'
+CHAT_ID = '944484522'
 
-# --- Flask сервер ---
+# --- Flask для Render ---
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "✅ Бот V-разворот работает!"
+    return "✅ V-бoт работает!"
+
+# --- Telegram отправка ---
+def send_telegram_message(message):
+    url = f'https://api.telegram.org/bot{TOKEN}/sendMessage'
+    payload = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
+    try:
+        requests.post(url, data=payload)
+    except:
+        pass
 
 # --- Память сигналов ---
-sent_buy = set()
+sent_ids = set()
 
-# --- RSI ---
+# --- Технические расчёты ---
 def calculate_rsi(closes, period=14):
     gains, losses = [], []
     for i in range(1, len(closes)):
@@ -30,7 +37,6 @@ def calculate_rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# --- EMA ---
 def calculate_ema(prices, period):
     k = 2 / (period + 1)
     ema = prices[0]
@@ -38,19 +44,17 @@ def calculate_ema(prices, period):
         ema = price * k + ema * (1 - k)
     return ema
 
-# --- BB Low ---
 def calculate_bb_low(prices, period=20, std_mult=2):
     sma = sum(prices[-period:]) / period
     std = (sum((p - sma) ** 2 for p in prices[-period:]) / period) ** 0.5
     return sma - std_mult * std
 
-# --- Проверка дивергенции ---
 def has_rsi_divergence(closes, rsi_now):
     return closes[-1] < closes[-2] < closes[-3] and rsi_now > calculate_rsi(closes[:-1])
 
-# --- Анализ таймфреймов ---
-def check_timeframes(symbol, listed):
-    for interval in ["15m", "1h", "4h"]:
+# --- Основная логика V-разворота ---
+def analyze_coin(symbol, listed):
+    for interval in ['15m', '1h', '4h']:
         try:
             url = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit=100"
             r = requests.get(url)
@@ -86,9 +90,11 @@ def check_timeframes(symbol, listed):
                 tp4 = round(last_close + diff * 2.618, 4)
 
                 signal_id = f"{symbol}_{interval}_BUY"
-                if signal_id not in sent_buy:
-                    sent_buy.add(signal_id)
-                    msg = f"""📈 <b>V-РАЗВОРОТ BUY</b> — <b>{interval}</b>
+                if signal_id in sent_ids:
+                    continue
+                sent_ids.add(signal_id)
+
+                message = f"""📈 <b>V-РАЗВОРОТ BUY</b> — <b>{interval}</b>
 <b>{symbol}</b> — ${last_close:.4f}
 
 <b>📍 Поддержка:</b> ${support:.4f}
@@ -102,55 +108,78 @@ def check_timeframes(symbol, listed):
 <b>R/R:</b> {round(rr, 2)}:1
 Биржи: {', '.join([x.capitalize() for x in listed if x in ['kraken', 'mexc', 'bybit']])}
 """
-                    bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='HTML')
-        except Exception as e:
-            print(f"⚠️ Ошибка в {symbol} [{interval}]: {e}")
+                send_telegram_message(message)
+        except:
+            continue
 
-# --- Главная функция анализа монет ---
-def analyze_market():
+# --- Получить список бирж из CoinGecko ---
+def get_coin_exchanges(coin_id):
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": 200,
-            "page": 1,
-            "sparkline": False
-        }
-        coins = requests.get(url, params=params).json()
+        url = f'https://api.coingecko.com/api/v3/coins/{coin_id}/tickers'
+        r = requests.get(url)
+        data = r.json()
+        exchanges = set()
+        for item in data.get('tickers', []):
+            ex = item.get('market', {}).get('name', '').lower()
+            if ex:
+                exchanges.add(ex)
+        return exchanges
+    except:
+        return set()
 
-        for coin in coins:
-            try:
-                symbol = coin["symbol"].upper()
-                price = coin["current_price"]
-                vol = coin["total_volume"]
-                cap = coin["market_cap"]
-                listed = [e.lower() for e in coin["platforms"].keys()]
-
-                if (
-                    price <= 5 and vol >= 1_000_000 and cap >= 5_000_000
-                    and not any(x in symbol.lower() for x in ["usd", "usdt", "busd", "tusd", "dai"])
-                    and symbol not in ["SCAM", "PIG", "TURD"]
-                    and any(x in listed for x in ["kraken", "mexc", "bybit"])
-                ):
-                    check_timeframes(symbol, listed)
-            except Exception as e:
-                print(f"⚠️ Ошибка монеты {coin['id']}: {e}")
-    except Exception as e:
-        print("❌ Ошибка CoinGecko:", e)
-
-# --- Автообновление ---
-def run_bot():
+# --- Главный цикл сканирования монет ---
+def scan_v_reversals():
     while True:
-        analyze_market()
-        time.sleep(180)
+        try:
+            print("🔁 Сканирую CoinGecko...")
+            url = 'https://api.coingecko.com/api/v3/coins/markets'
+            params = {
+                'vs_currency': 'usd',
+                'order': 'market_cap_desc',
+                'per_page': 250,
+                'page': 1,
+                'sparkline': 'false'
+            }
+            response = requests.get(url, params=params)
+            coins = response.json()
 
-# --- Запуск ---
+            for coin in coins:
+                try:
+                    coin_id = coin['id']
+                    symbol = coin['symbol'].upper()
+                    price = coin['current_price']
+                    ath = coin['ath']
+                    volume = coin['total_volume']
+                    market_cap = coin['market_cap']
+
+                    if ath == 0 or price == 0:
+                        continue
+                    if price > 5:
+                        continue
+                    if volume < 1_000_000:
+                        continue
+                    if market_cap < 5_000_000:
+                        continue
+                    if symbol in ['USDT', 'BUSD', 'TUSD', 'DAI', 'USD']:
+                        continue
+
+                    listed = get_coin_exchanges(coin_id)
+                    if not listed or not any(x in listed for x in ['kraken', 'mexc', 'bybit']):
+                        continue
+
+                    analyze_coin(symbol, listed)
+
+                except:
+                    continue
+
+            time.sleep(180)
+        except Exception as e:
+            print("Ошибка:", e)
+            time.sleep(180)
+
+# --- Запуск бота ---
 if __name__ == '__main__':
-    try:
-        bot.send_message(chat_id=CHAT_ID, text="🤖 Бот на V-разворот ЗАПУЩЕН!")
-        print("✅ Стартовое сообщение Telegram отправлено.")
-    except Exception as e:
-        print(f"❌ Ошибка Telegram: {e}")
-    threading.Thread(target=run_bot).start()
-    app.run(host='0.0.0.0', port=8080)
+    send_telegram_message("🤖 Бот V-разворота запущен!")
+    print("🚀 Бот запущен и работает...")
+    threading.Thread(target=scan_v_reversals).start()
+    app.run(host='0.0.0.0', port=10000)
