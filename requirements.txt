@@ -1,3 +1,4 @@
-requests
+
 flask
-pyTelegramBotAPI
+requests
+python-telegram-bot
