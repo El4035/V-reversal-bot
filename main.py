@@ -2,7 +2,6 @@ import os
 import requests
 from flask import Flask
 from telegram import Bot
-
 # --- Telegram настройки ---
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
