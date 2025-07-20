@@ -1,4 +1,4 @@
-
+# V-reversal bot 1 — backup version from 9:16 PM
 import time
 import requests
 from datetime import datetime
