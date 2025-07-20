@@ -1,130 +1,155 @@
 import requests
 import time
+from datetime import datetime
 from flask import Flask
-from threading import Thread
 from telegram import Bot
 
+# --- Telegram настройки ---
 TOKEN = "8111573872:AAE_LGmsgtGmKmOxx2v03Tsd5bL28z9bL3Y"
 CHAT_ID = 944484522
 bot = Bot(token=TOKEN)
 
+# --- Flask сервер ---
 app = Flask(__name__)
-
-@app.route('/')
+@app.route("/")
 def home():
-    return "✅ V-разворот бот активен!"
+    return "V-Reversal bot is alive!"
 
-def fetch_top_coins():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
+# --- Конфигурация ---
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+VS_CURRENCY = "usd"
+ALLOWED_EXCHANGES = ["mexc", "bybit", "kraken"]
+MAX_PRICE = 5.0
+MIN_VOLUME = 1_000_000
+MIN_MARKET_CAP = 5_000_000
+MIN_DROP_FROM_ATH = 0.75
+INTERVALS = {"15m": "15m", "1h": "1h", "4h": "4h"}
+
+sent_signals = set()
+
+# --- Индикаторы ---
+def calculate_rsi(closes, period=14):
+    deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
+    seed = deltas[:period]
+    up = sum(x for x in seed if x > 0) / period
+    down = -sum(x for x in seed if x < 0) / period
+    rs = up / down if down != 0 else 0
+    rsi = [100 - 100 / (1 + rs)]
+    for delta in deltas[period:]:
+        upval = max(delta, 0)
+        downval = -min(delta, 0)
+        up = (up * (period - 1) + upval) / period
+        down = (down * (period - 1) + downval) / period
+        rs = up / down if down != 0 else 0
+        rsi.append(100 - 100 / (1 + rs))
+    return rsi[-1] if rsi else 0
+
+def calculate_ema(data, period):
+    k = 2 / (period + 1)
+    ema = data[0]
+    for price in data[1:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+def calculate_bb(closes, period=20):
+    if len(closes) < period:
+        return None, None, None
+    sma = sum(closes[-period:]) / period
+    std = (sum((x - sma) ** 2 for x in closes[-period:]) / period) ** 0.5
+    return sma - 2 * std, sma, sma + 2 * std
+
+# --- Получение списка монет ---
+def fetch_eligible_coins():
     params = {
-        "vs_currency": "usd",
+        "vs_currency": VS_CURRENCY,
         "order": "market_cap_desc",
         "per_page": 200,
         "page": 1,
-        "sparkline": False
+        "sparkline": "false"
     }
-    return requests.get(url, params=params).json()
+    coins = requests.get(COINGECKO_URL, params=params).json()
+    result = []
+    for coin in coins:
+        if (
+            coin.get("current_price") and coin["current_price"] <= MAX_PRICE and
+            coin.get("total_volume") and coin["total_volume"] >= MIN_VOLUME and
+            coin.get("market_cap") and coin["market_cap"] >= MIN_MARKET_CAP and
+            coin.get("ath") and coin["ath"] > 0 and
+            coin["current_price"] / coin["ath"] <= 1 - MIN_DROP_FROM_ATH and
+            coin.get("platforms") and any(ex in coin["platforms"] for ex in ALLOWED_EXCHANGES) and
+            "usd" not in coin["symbol"].lower()
+        ):
+            result.append(coin["symbol"].upper() + "USDT")
+    return result
 
-def is_valid_coin(coin):
-    symbol = coin["symbol"].upper()
-    name = coin["name"].lower()
-    price = coin["current_price"]
-    volume = coin["total_volume"]
-    cap = coin["market_cap"]
-    exchanges = [ex.lower() for ex in coin.get("platforms", {}).keys()]
-    blacklist = ["PIG", "TURD", "SCAM", "ASS", "FART"]
-
-    if any(bad in symbol for bad in blacklist): return False
-    if "usd" in symbol.lower(): return False
-    if price > 3 or volume < 1_000_000 or cap < 5_000_000: return False
-    allowed_exchanges = ["kraken", "mexc", "bybit"]
-    if not any(ex in exchanges for ex in allowed_exchanges): return False
-
-    return True
-
-def calculate_indicators(prices):
-    import numpy as np
-    import pandas as pd
-
-    df = pd.DataFrame(prices, columns=["time", "open", "high", "low", "close", "volume"])
-    df["EMA21"] = df["close"].ewm(span=21).mean()
-    df["EMA50"] = df["close"].ewm(span=50).mean()
-    delta = df["close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["BB_MA"] = df["close"].rolling(window=20).mean()
-    df["BB_STD"] = df["close"].rolling(window=20).std()
-    df["BB_LOW"] = df["BB_MA"] - 2 * df["BB_STD"]
-    return df
-
-def fetch_binance_ohlc(symbol):
-    url = f"https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol.upper() + "USDT", "interval": "1h", "limit": 100}
+# --- Анализ одной монеты ---
+def analyze_symbol(symbol, interval):
+    params = {"symbol": symbol.lower(), "interval": interval, "limit": 100}
     try:
-        res = requests.get(url, params=params)
-        return res.json()
-    except:
-        return None
+        response = requests.get(BINANCE_URL, params={"symbol": symbol, "interval": interval, "limit":100})
+        data = response.json()
+        if not isinstance(data, list) or len(data) < 50:
+            return
+        closes = [float(c[4]) for c in data]
+        lows = [float(c[3]) for c in data]
+        volumes = [float(c[5]) for c in data]
+        last_close = closes[-1]
+        last_low = lows[-1]
+        support = min(lows[-10:])
+        rsi = calculate_rsi(closes)
+        ema21 = calculate_ema(closes[-21:], 21)
+        ema50 = calculate_ema(closes[-50:], 50)
+        bb_low, _, _ = calculate_bb(closes)
 
-def send_signal(symbol, interval, last_close, stop, tp, rr):
-    text = (
-        f"🤖 <b>BUY</b> на <b>{interval}</b>\n"
-        f"🔷 Монета: <b>{symbol}</b>\n"
-        f"💰 Entry: <b>{round(last_close, 5)}</b>\n"
-        f"🛑 Stop: <b>{round(stop, 5)}</b>\n"
-        f"🎯 TP: <b>{round(tp, 5)}</b>\n"
-        f"📈 R/R = <b>{round(rr, 2)}:1</b>"
-    )
-    try:
-        bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        # Условия входа
+        if (
+            rsi <= 35 and
+            last_close < bb_low and
+            last_close > ema21 > ema50 and
+            volumes[-1] > sum(volumes[-6:-1]) / 5 and
+            last_low <= support * 1.01
+        ):
+            stop = support * 0.99
+            tp = support + (last_close - support) * 1.618  # заменили расчёт TP
+            rr = (tp - last_close) / (last_close - stop)
+            if rr < 3:
+                return
+            signal_id = f"{symbol}_{interval}"
+            if signal_id in sent_signals:
+                return
+            sent_signals.add(signal_id)
+            text = (
+                f"📡 <b>BUY</b> на <b>{interval}</b>\n"
+                f"🔹 Монета: <b>{symbol}</b>\n"
+                f"💰 Entry: <b>{round(last_close, 5)}</b>\n"
+                f"🛑 Stop: <b>{round(stop, 5)}</b>\n"
+                f"🎯 TP: <b>{round(tp, 5)}</b>\n"
+                f"📈 R/R: <b>{round(rr, 2)}:1</b>\n"
+                f"#Vreversal #Crypto"
+            )
+            bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='HTML')
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"❌ Ошибка по {symbol}: {e}")
 
-def check_coin(coin):
-    symbol = coin["symbol"].upper()
-    prices = fetch_binance_ohlc(symbol)
-    if not prices or len(prices) < 30: return
-
-    df = calculate_indicators(prices)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    rsi_ok = last["RSI"] > prev["RSI"] and last["RSI"] <= 35
-    bb_ok = last["close"] > last["BB_LOW"] and prev["close"] < prev["BB_LOW"]
-    ema_ok = last["close"] > last["EMA21"] > last["EMA50"]
-    volume_ok = last["volume"] > df["volume"].rolling(10).mean().iloc[-1]
-    support = min(df["low"][-10:])
-
-    if not (rsi_ok and bb_ok and ema_ok and volume_ok):
-        return
-
-    last_close = last["close"]
-    stop = support * 0.99
-    tp = support + (last_close - support) * 1.618
-    rr = (tp - last_close) / (last_close - stop)
-
-    if rr < 3:
-        return
-
-    send_signal(symbol, "1H", last_close, stop, tp, rr)
-
+# --- Главный цикл ---
 def run_bot():
     try:
-        bot.send_message(chat_id=CHAT_ID, text="🤖 Бот запущен: V-разворот активен!")
-    except: pass
+        coins = fetch_eligible_coins()
+        for interval in INTERVALS.values():
+            for symbol in coins:
+                analyze_symbol(symbol, interval)
+    except Exception as e:
+        print("❌ Ошибка запуска:", e)
 
+# --- Telegram старт ---
+try:
+    bot.send_message(chat_id=CHAT_ID, text="✅ V-Reversal бот запущен!")
+except:
+    pass
+
+# --- Автообновление ---
+if __name__ == "__main__":
     while True:
-        try:
-            coins = fetch_top_coins()
-            for coin in coins:
-                if is_valid_coin(coin):
-                    check_coin(coin)
-        except Exception as e:
-            print(f"Error: {e}")
+        run_bot()
         time.sleep(180)
-
-if __name__ == '__main__':
-    Thread(target=run_bot).start()
-    app.run(host='0.0.0.0', port=8080)
