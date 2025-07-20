@@ -1,7 +1,6 @@
 import requests
 import time
 import math
-import numpy as np
 from datetime import datetime
 from flask import Flask
 from telegram import Bot
